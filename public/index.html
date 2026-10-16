@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地生图</title>
+  <style>
+    :root { color-scheme: light; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; background: #f3f3ee; color: #20241f; }
+    main { width: min(760px, calc(100% - 32px)); margin: 64px auto; }
+    h1 { margin: 0 0 8px; font-size: clamp(2rem, 5vw, 3rem); letter-spacing: -.04em; }
+    .intro { margin: 0 0 32px; color: #626a60; line-height: 1.6; }
+    .panel { background: #fff; border: 1px solid #dedfd7; border-radius: 18px; padding: 24px; box-shadow: 0 16px 50px #1f2b190d; }
+    label { display: block; margin-bottom: 12px; font-weight: 650; }
+    textarea { width: 100%; min-height: 145px; resize: vertical; border: 1px solid #bac1b4; border-radius: 10px; padding: 14px; font: inherit; line-height: 1.5; color: inherit; background: #fff; }
+    textarea:focus { outline: 3px solid #d6e9bc; border-color: #517342; }
+    .actions { display: flex; align-items: center; gap: 16px; margin-top: 16px; }
+    button { border: 0; border-radius: 9px; background: #254a2c; color: #fff; font: inherit; font-weight: 650; padding: 11px 18px; cursor: pointer; }
+    button:hover { background: #1b3b22; }
+    button:disabled { opacity: .5; cursor: wait; }
+    .hint { color: #687166; font-size: .9rem; }
+    .result { margin-top: 22px; }
+    .status { display: flex; align-items: center; gap: 10px; min-height: 28px; font-weight: 600; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; background: #a0aaa0; }
+    .dot.pending { background: #d29932; }
+    .dot.running { background: #427ec5; animation: pulse 1.2s infinite; }
+    .dot.done { background: #3c8b4b; }
+    .dot.failed { background: #c54e4e; }
+    @keyframes pulse { 50% { opacity: .35; } }
+    .error { color: #a52828; white-space: pre-wrap; overflow-wrap: anywhere; }
+    img { display: block; width: 100%; max-width: 640px; height: auto; margin: 20px auto 0; border-radius: 12px; background: #eee; }
+    .meta { margin-top: 12px; color: #687166; font-size: .9rem; text-align: center; }
+    .download { display: inline-block; margin-top: 10px; color: #254a2c; }
+    [hidden] { display: none !important; }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>本地生图</h1>
+    <p class="intro">输入画面描述，Codex 会在这台 Mac 上生成一张图片。生成可能需要几分钟。</p>
+    <section class="panel">
+      <form id="form">
+        <label for="prompt">画面描述</label>
+        <textarea id="prompt" maxlength="1000" placeholder="例如：一只橘猫坐在窗边，午后的阳光洒在木桌上，水彩插画风格" required></textarea>
+        <div class="actions">
+          <button id="submit" type="submit">生成图片</button>
+          <span class="hint">每次生成一张；输出尺寸由 Codex 决定</span>
+        </div>
+      </form>
+      <div class="result" id="result" hidden>
+        <div class="status"><span class="dot" id="dot"></span><span id="status"></span></div>
+        <p class="error" id="error" hidden></p>
+        <img id="image" alt="生成的图片" hidden>
+        <p class="meta" id="meta" hidden></p>
+        <a class="download" id="download" download="codex-image.png" hidden>下载 PNG</a>
+      </div>
+    </section>
+  </main>
+  <script>
+    const form = document.querySelector('#form');
+    const promptInput = document.querySelector('#prompt');
+    const submit = document.querySelector('#submit');
+    const result = document.querySelector('#result');
+    const dot = document.querySelector('#dot');
+    const statusText = document.querySelector('#status');
+    const errorText = document.querySelector('#error');
+    const image = document.querySelector('#image');
+    const meta = document.querySelector('#meta');
+    const download = document.querySelector('#download');
+    const labels = { pending: '排队中', running: '生成中', done: '已完成', failed: '生成失败' };
+    let activeJob = sessionStorage.getItem('imagegen-job-id');
+
+    function render(job) {
+      result.hidden = false;
+      dot.className = `dot ${job.status}`;
+      statusText.textContent = labels[job.status] || job.status;
+      errorText.hidden = !job.error;
+      errorText.textContent = job.error || '';
+      const done = job.status === 'done' && job.image_url;
+      image.hidden = !done;
+      meta.hidden = !done;
+      download.hidden = !done;
+      if (done) {
+        image.src = job.image_url;
+        download.href = job.image_url;
+        meta.textContent = `${job.width} × ${job.height} 像素`;
+      } else {
+        image.removeAttribute('src');
+      }
+      submit.disabled = job.status === 'pending' || job.status === 'running';
+    }
+
+    async function poll(id) {
+      if (id !== activeJob) return;
+      try {
+        const response = await fetch(`/api/jobs/${id}`, { cache: 'no-store' });
+        if (!response.ok) throw new Error(response.status === 404 ? '任务已失效，请重新提交' : `查询失败（${response.status}）`);
+        const job = await response.json();
+        if (id !== activeJob) return;
+        render(job);
+        if (job.status === 'pending' || job.status === 'running') {
+          setTimeout(() => poll(id), 3000);
+        }
+      } catch (error) {
+        if (id !== activeJob) return;
+        result.hidden = false;
+        statusText.textContent = '状态查询暂时失败';
+        errorText.textContent = error.message;
+        errorText.hidden = false;
+        if (error.message === '任务已失效，请重新提交') {
+          sessionStorage.removeItem('imagegen-job-id');
+          activeJob = null;
+          submit.disabled = false;
+          return;
+        }
+        setTimeout(() => poll(id), 5000);
+      }
+    }
+
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      if (!promptInput.value.trim()) return;
+      submit.disabled = true;
+      errorText.hidden = true;
+      try {
+        const response = await fetch('/api/jobs', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ prompt: promptInput.value.trim() }),
+        });
+        const job = await response.json();
+        if (!response.ok) throw new Error(job.error || `提交失败（${response.status}）`);
+        activeJob = job.id;
+        sessionStorage.setItem('imagegen-job-id', job.id);
+        render(job);
+        poll(job.id);
+      } catch (error) {
+        result.hidden = false;
+        statusText.textContent = '提交失败';
+        errorText.textContent = error.message;
+        errorText.hidden = false;
+        submit.disabled = false;
+      }
+    });
+
+    if (activeJob) poll(activeJob);
+  </script>
+</body>
+</html>

@@ -10,7 +10,7 @@ export async function generateWithCodex({ prompt, file, outputDir, signal }) {
     '<image_description>',
     prompt,
     '</image_description>',
-    '生成一张方图。工具生成后，把最终图片复制为 PNG 到以下绝对路径：',
+    '生成一张 16:9 横向宽屏图（landscape aspect ratio 16:9）。工具生成后，把最终图片复制为 PNG 到以下绝对路径：',
     file,
     '确认该 PNG 文件存在且非空。不要生成 SVG、HTML 或替代图片。',
   ].join('\n');

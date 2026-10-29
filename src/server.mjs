@@ -1,8 +1,9 @@
-import { createReadStream, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
-import { mkdir, readFile, rm } from 'node:fs/promises';
+import { createReadStream, mkdirSync, readFileSync, readdirSync, writeFileSync, renameSync } from 'node:fs';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import http from 'node:http';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { inspectPng, inspectPngSync } from './png.mjs';
 
@@ -46,6 +47,7 @@ function durationMs(job) {
 function publicJob(job) {
   return {
     id: job.id,
+    idempotency_key: job.idempotencyKey || null,
     prompt: job.prompt,
     status: job.status,
     error: job.error,
@@ -56,19 +58,28 @@ function publicJob(job) {
     started_at: job.startedAt ?? null,
     finished_at: job.finishedAt ?? null,
     duration_ms: durationMs(job),
+    queue_ms: typeof job.startedAt === "number" && typeof job.createdAt === "number" ? job.startedAt - job.createdAt : null,
+    aspect_ratio: job.aspectRatio || "16:9",
+    reference_ids: job.referenceIds || [],
   };
 }
 
-export function createApp({ outputDir, generateImage }) {
+export function createApp({ outputDir, generateImage, workers, concurrency = 1 }) {
   const jobs = new Map();
   const queue = [];
-  let processing = false;
+  if (!Number.isInteger(concurrency) || concurrency < 1 || concurrency > 4) throw new Error("并发须为 1–4");
+  const generators = workers ?? (generateImage ? [generateImage] : []);
+  if (!generators.length || generators.some((generate) => typeof generate !== 'function')) {
+    throw new Error("至少要有一条生图车道");
+  }
+  const lanes = generators.map((generate) => ({ generate, active: 0 }));
   const jobsFile = path.join(outputDir, 'jobs.json');
 
   function saveJobs() {
     try {
       mkdirSync(outputDir, { recursive: true });
-      writeFileSync(jobsFile, JSON.stringify([...jobs.values()], null, 2));
+      writeFileSync(`${jobsFile}.tmp`, JSON.stringify([...jobs.values()], null, 2));
+      renameSync(`${jobsFile}.tmp`, jobsFile);
     } catch (error) {
       console.error(`无法保存历史记录：${error.message}`);
     }
@@ -101,6 +112,10 @@ export function createApp({ outputDir, generateImage }) {
       jobs.set(job.id, {
         id: job.id,
         prompt: job.prompt,
+        aspectRatio: job.aspectRatio || "16:9",
+        referenceIds: job.referenceIds || [],
+        idempotencyKey: job.idempotencyKey || null,
+        importDigest: job.importDigest || null,
         status: job.status,
         error: typeof job.error === 'string' ? job.error : null,
         width: Number.isInteger(job.width) ? job.width : null,
@@ -150,36 +165,47 @@ export function createApp({ outputDir, generateImage }) {
     return [...jobs.values()].sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0));
   }
 
-  async function drain() {
-    if (processing) return;
-    processing = true;
-    try {
-      while (queue.length) {
-        const job = jobs.get(queue.shift());
-        if (!job) continue;
-        job.status = 'running';
-        job.startedAt = Date.now();
-        saveJobs();
-        const file = path.join(outputDir, `${job.id}.png`);
+  function pickLane() {
+    let chosen = null;
+    for (const lane of lanes) {
+      if (lane.active >= concurrency) continue;
+      if (!chosen || lane.active < chosen.active) chosen = lane;
+    }
+    return chosen;
+  }
+
+  function drain() {
+    while (queue.length) {
+      const lane = pickLane();
+      if (!lane) return;
+      const job = jobs.get(queue.shift());
+      if (!job) continue;
+      lane.active++;
+      job.status = 'running';
+      job.startedAt = Date.now();
+      saveJobs();
+      const file = path.join(outputDir, `${job.id}.png`);
+      void (async () => {
         try {
           await mkdir(outputDir, { recursive: true });
-          await generateImage({ prompt: job.prompt, file, outputDir });
+          await lane.generate({ prompt: job.prompt, file, outputDir,
+            aspectRatio: job.aspectRatio || '16:9',
+            references: (job.referenceIds || []).map(id => path.join(outputDir, `${id}.png`)) });
           const image = await inspectPng(file);
           job.status = 'done';
           job.width = image.width;
           job.height = image.height;
-          job.finishedAt = Date.now();
         } catch (error) {
           job.status = 'failed';
           job.error = error instanceof Error ? error.message : String(error);
-          job.finishedAt = Date.now();
           await rm(file, { force: true }).catch(() => {});
-          console.error(`Job ${job.id} failed: ${job.error}`);
+        } finally {
+          job.finishedAt = Date.now();
+          saveJobs();
+          lane.active--;
+          drain();
         }
-        saveJobs();
-      }
-    } finally {
-      processing = false;
+      })();
     }
   }
 
@@ -197,16 +223,65 @@ export function createApp({ outputDir, generateImage }) {
         return;
       }
 
+      if (req.method === 'POST' && pathname === '/api/references') {
+        if (req.headers['content-type'] !== 'image/png') {
+          sendJson(res, 415, { error: '参考图必须是 PNG' }); return;
+        }
+        const chunks = []; let size = 0;
+        for await (const chunk of req) {
+          size += chunk.length;
+          if (size > 20 * 1024 * 1024) {
+            sendJson(res, 413, { error: '参考图不能超过 20 MB' }); return;
+          }
+          chunks.push(chunk);
+        }
+        const bytes = Buffer.concat(chunks);
+        const digest = createHash('sha256').update(bytes).digest('hex');
+        const existing = [...jobs.values()].find(job => job.importDigest === digest && job.status === 'done');
+        if (existing) { sendJson(res, 200, publicJob(existing)); return; }
+        const id = randomUUID();
+        await mkdir(outputDir, { recursive: true });
+        const file = path.join(outputDir, `${id}.png`);
+        await writeFile(file, bytes);
+        let image;
+        try { image = await inspectPng(file); }
+        catch { await rm(file, { force: true }); sendJson(res, 400, { error: '参考图不是有效 PNG' }); return; }
+        const now = Date.now();
+        const job = { id, prompt: '', aspectRatio: '1:1', referenceIds: [], importDigest: digest,
+          status: 'done', error: null, width: image.width, height: image.height,
+          createdAt: now, startedAt: now, finishedAt: now };
+        remember(job); sendJson(res, 201, publicJob(job)); return;
+      }
+
       if (req.method === 'POST' && pathname === '/api/jobs') {
         const body = await readJson(req);
         const prompt = typeof body?.prompt === 'string' ? body.prompt.trim() : '';
         if (!prompt || prompt.length > 4200) {
-          sendJson(res, 400, { error: '提示词须为 1–1000 个字符' });
+          sendJson(res, 400, { error: '提示词须为 1–4200 个字符' });
           return;
+        }
+        const aspectRatio = body.aspect_ratio || '16:9';
+        const referenceIds = body.reference_ids || [];
+        const idempotencyKey = body.idempotency_key || null;
+        if (!['16:9', '9:16', '1:1', '3:4'].includes(aspectRatio) ||
+            !Array.isArray(referenceIds) || referenceIds.length > 3 ||
+            referenceIds.some(id => typeof id !== 'string' || !UUID.test(id)) ||
+            (idempotencyKey !== null && (typeof idempotencyKey !== 'string' || idempotencyKey.length > 200))) {
+          sendJson(res, 400, { error: '画幅、参考图或幂等键无效' }); return;
+        }
+        const previous = idempotencyKey && [...jobs.values()].find(j => j.idempotencyKey === idempotencyKey);
+        if (previous) {
+          if (previous.prompt !== prompt || previous.aspectRatio !== aspectRatio || JSON.stringify(previous.referenceIds) !== JSON.stringify(referenceIds)) {
+            sendJson(res, 409, { error: '幂等键已用于不同请求' }); return;
+          }
+          sendJson(res, 200, publicJob(previous)); return;
+        }
+        if (referenceIds.some(id => jobs.get(id)?.status !== 'done')) {
+          sendJson(res, 400, { error: '参考图必须是已完成的任务' }); return;
         }
         const id = randomUUID();
         const job = {
-          id, prompt, status: 'pending', error: null,
+          id, prompt, aspectRatio, referenceIds, idempotencyKey, status: 'pending', error: null,
           width: null, height: null, createdAt: Date.now(),
           startedAt: null, finishedAt: null,
         };

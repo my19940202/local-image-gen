@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node src/index.mjs",
+    "start": "env PORT=3099 node src/index.mjs",
     "test": "node --test"
   },
   "engines": {
